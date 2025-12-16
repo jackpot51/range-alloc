@@ -96,6 +96,61 @@ where
         }
     }
 
+    //TODO: merge this code with allocate_range?
+    pub fn allocate_exact_range(&mut self, exact: Range<T>) -> Result<Range<T>, RangeAllocationError<T>> {
+        let length = exact.end - exact.start;
+        assert_ne!(length + length, length);
+        let mut best_fit: Option<(usize, Range<T>)> = None;
+
+        // This is actually correct. With the trait bound as it is, we have
+        // no way to summon a value of 0 directly, so we make one by subtracting
+        // something from itself. Once the trait bound can be changed, this can
+        // be fixed.
+        #[allow(clippy::eq_op)]
+        let mut fragmented_free_length = length - length;
+        for (index, range) in self.free_ranges.iter().cloned().enumerate() {
+            let range_length = range.end - range.start;
+            fragmented_free_length += range_length;
+            if range_length < length {
+                continue;
+            } else if range.start > exact.start {
+                // Exact range is before this free range
+                continue;
+            } else if range.end < exact.end {
+                // Exact range is after this free range
+                continue;
+            } else if range_length == length {
+                // Found a perfect fit, so stop looking.
+                best_fit = Some((index, range));
+                break;
+            }
+            best_fit = Some(match best_fit {
+                Some((best_index, best_range)) => {
+                    // Find best fit for this allocation to reduce memory fragmentation.
+                    if range_length < best_range.end - best_range.start {
+                        (index, range)
+                    } else {
+                        (best_index, best_range.clone())
+                    }
+                }
+                None => (index, range),
+            });
+        }
+        match best_fit {
+            Some((index, range)) => {
+                if range.end - range.start == length {
+                    self.free_ranges.remove(index);
+                } else {
+                    self.free_ranges[index].start += length;
+                }
+                Ok(range.start..(range.start + length))
+            }
+            None => Err(RangeAllocationError {
+                fragmented_free_length,
+            }),
+        }
+    }
+
     pub fn free_range(&mut self, range: Range<T>) {
         assert!(self.initial_range.start <= range.start && range.end <= self.initial_range.end);
         assert!(range.start < range.end);
@@ -197,6 +252,19 @@ mod tests {
         let mut alloc = RangeAllocator::new(0..10);
         // Test if an allocation works
         assert_eq!(alloc.allocate_range(4), Ok(0..4));
+        assert!(alloc.allocated_ranges().eq(std::iter::once(0..4)));
+        // Free the prior allocation
+        alloc.free_range(0..4);
+        // Make sure the free actually worked
+        assert_eq!(alloc.free_ranges, vec![0..10]);
+        assert!(alloc.allocated_ranges().eq(std::iter::empty()));
+    }
+
+    #[test]
+    fn test_basic_allocation_exact() {
+        let mut alloc = RangeAllocator::new(0..10);
+        // Test if an allocation works
+        assert_eq!(alloc.allocate_exact_range(0..4), Ok(0..4));
         assert!(alloc.allocated_ranges().eq(std::iter::once(0..4)));
         // Free the prior allocation
         alloc.free_range(0..4);
@@ -349,6 +417,19 @@ mod tests {
         assert_eq!(alloc.allocate_range(3), Ok(0..3));
         assert_eq!(alloc.allocate_range(3), Ok(3..6));
         assert_eq!(alloc.allocate_range(3), Ok(6..9));
+        alloc.free_range(0..3);
+        alloc.free_range(6..9);
+        alloc.free_range(3..6);
+        assert_eq!(alloc.free_ranges, vec![0..9]);
+        assert!(alloc.allocated_ranges().eq(std::iter::empty()));
+    }
+
+    #[test]
+    fn test_merge_neighbors_exact() {
+        let mut alloc = RangeAllocator::new(0..9);
+        assert_eq!(alloc.allocate_exact_range(0..3), Ok(0..3));
+        assert_eq!(alloc.allocate_exact_range(3..6), Ok(3..6));
+        assert_eq!(alloc.allocate_exact_range(6..9), Ok(6..9));
         alloc.free_range(0..3);
         alloc.free_range(6..9);
         alloc.free_range(3..6);
